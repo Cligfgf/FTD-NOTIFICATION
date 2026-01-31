@@ -68,11 +68,22 @@ def send_telegram_message(message: str) -> tuple[bool, str]:
 
 
 def country_to_flag(code: str) -> str:
-    """Konverter 2-bogstavs landekode til flag-emoji (fx DK -> 🇩🇰)."""
-    if not code or len(str(code)) != 2:
+    """Konverter landekode eller landenavn til flag-emoji (fx DK/Denmark -> 🇩🇰, Germany -> 🇩🇪)."""
+    if not code:
+        return "🌍"
+    s = str(code).strip()
+    # Fulde landenavne -> ISO-kode (fx Germany -> DE, ikke Ge -> Georgia)
+    mapping = {
+        "germany": "DE", "denmark": "DK", "sweden": "SE", "norway": "NO", "finland": "FI",
+        "czech republic": "CZ", "italy": "IT", "spain": "ES", "france": "FR", "poland": "PL",
+        "uk": "GB", "united kingdom": "GB", "georgia": "GE", "austria": "AT", "switzerland": "CH",
+        "netherlands": "NL", "belgium": "BE", "portugal": "PT", "greece": "GR", "romania": "RO",
+    }
+    iso = mapping.get(s.lower(), s[:2] if len(s) == 2 else "")
+    if not iso or len(iso) != 2:
         return "🌍"
     try:
-        return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in str(code).upper() if "A" <= c <= "Z")
+        return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in iso.upper() if "A" <= c <= "Z")
     except (TypeError, ValueError):
         return "🌍"
 
@@ -88,7 +99,7 @@ def format_ftd_message(data: dict) -> str:
         p = str(payout) if payout else "0"
     if not str(p).startswith("$"):
         p = f"${p}"
-    flag = country_to_flag(str(country)[:2] if country else "")
+    flag = country_to_flag(str(country).strip() if country else "")
     return f"{p} - {offer} - {flag}"
 
 
@@ -161,10 +172,12 @@ def postback():
         logger.info(f"Ingen payout - springer Telegram over")
         return jsonify({"status": "skipped", "message": "No payout"}), 200
     
+    # Kun spring over hvis tydeligt IKKE FTD (fx lead/reg). Tom eller ukendt = send (har payout)
     conv_type = str(data.get("conversionType", data.get("conversion_type", data.get("et", data.get("type", ""))))).upper()
-    if conv_type and "FTD" not in conv_type and "CUSTOM" not in conv_type:
-        logger.info(f"Ikke FTD (type={conv_type}) - springer Telegram over")
-        return jsonify({"status": "skipped", "message": "Not FTD"}), 200
+    if conv_type and "FTD" not in conv_type and "CUSTOM" not in conv_type and "SALE" not in conv_type:
+        if any(x in conv_type for x in ("LEAD", "REG", "REGISTRATION", "CLICK")):
+            logger.info(f"Ikke FTD (type={conv_type}) - springer Telegram over")
+            return jsonify({"status": "skipped", "message": "Not FTD"}), 200
     
     # Send Telegram (instant)
     message = format_ftd_message(data)

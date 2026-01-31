@@ -63,7 +63,7 @@ def format_ftd(row, i):
     country = row.get("campaignCountry", row.get("countryCode", ""))
     rev = float(row.get("allConversionsRevenue", 0) or 0) + float(row.get("customRevenue1", 0) or 0) + float(row.get("customRevenue2", 0) or 0)
     p = f"${rev:.2f}"
-    flag = country_to_flag(str(country)[:2] if country else "")
+    flag = country_to_flag(str(country).strip() if country else "")
     return f"{p} - {offer} - {flag}"
 
 
