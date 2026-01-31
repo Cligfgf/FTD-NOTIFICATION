@@ -21,6 +21,7 @@ load_dotenv()
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+VOLUUM_FORWARD_URL = os.getenv("VOLUUM_FORWARD_URL", "").rstrip("/")  # fx https://lowasteisranime.com
 
 # Flask app
 app = Flask(__name__)
@@ -66,43 +67,27 @@ def send_telegram_message(message: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+def country_to_flag(code: str) -> str:
+    """Konverter 2-bogstavs landekode til flag-emoji (fx DK -> 🇩🇰)."""
+    if not code or len(str(code)) != 2:
+        return "🌍"
+    try:
+        return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in str(code).upper() if "A" <= c <= "Z")
+    except (TypeError, ValueError):
+        return "🌍"
+
+
 def format_ftd_message(data: dict) -> str:
-    """Format FTD data into a nice Telegram message."""
-    # Extract common Voluum parameters
-    click_id = data.get("cid", data.get("clickid", "N/A"))
-    payout = data.get("payout", data.get("revenue", "N/A"))
-    campaign = data.get("campaign", data.get("camp", "N/A"))
-    country = data.get("country", data.get("geo", "N/A"))
-    offer = data.get("offer", data.get("lander", "N/A"))
-    source = data.get("source", data.get("traffic_source", "N/A"))
-    
-    # Custom variables (sub1-sub10)
-    custom_vars = []
-    for i in range(1, 11):
-        for key in [f"sub{i}", f"var{i}", f"c{i}"]:
-            if data.get(key):
-                custom_vars.append(f"  • {key}: {data.get(key)}")
-                break
-    
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    message = f"""
-🎉 <b>NY FTD!</b> 🎉
-
-💰 <b>Payout:</b> {payout}
-📍 <b>Country:</b> {country}
-📢 <b>Campaign:</b> {campaign}
-🎯 <b>Offer:</b> {offer}
-🔗 <b>Source:</b> {source}
-🔑 <b>Click ID:</b> <code>{click_id}</code>
-
-⏰ <b>Tid:</b> {timestamp}
-"""
-    
-    if custom_vars:
-        message += "\n📊 <b>Custom Variables:</b>\n" + "\n".join(custom_vars)
-    
-    return message.strip()
+    """Format FTD – flag, offer, payout på én linje."""
+    offer = data.get("offer", data.get("offerName", data.get("offer_id", data.get("lander", "?"))))
+    country = data.get("country", data.get("countryCode", data.get("geo", data.get("cc", ""))))
+    payout = data.get("payout", data.get("revenue", data.get("amount", data.get("allConversionsRevenue", 0))))
+    try:
+        p = f"${float(payout):.2f}"
+    except (TypeError, ValueError):
+        p = str(payout) if payout else "?"
+    flag = country_to_flag(str(country)[:2] if country else "")
+    return f"{flag} - {offer} - {p}"
 
 
 @app.route("/", methods=["GET"])
@@ -115,35 +100,87 @@ def index():
     })
 
 
+def _forward_to_voluum():
+    """Videresend request til Voluum så de stadig modtager konverteringen."""
+    if not VOLUUM_FORWARD_URL:
+        return
+    url = f"{VOLUUM_FORWARD_URL}/postback"
+    try:
+        if request.method == "GET":
+            r = requests.get(url, params=request.args, timeout=10)
+        else:
+            r = requests.post(url, data=request.form or None, json=request.json if request.is_json else None, params=request.args, timeout=10)
+        logger.info(f"Forwarded to Voluum: {r.status_code}")
+    except Exception as e:
+        logger.error(f"Voluum forward fejl: {e}")
+
+
 @app.route("/postback", methods=["GET", "POST"])
 def postback():
     """
-    Receive Voluum postback and send Telegram notification.
-    
-    Voluum Postback URL format:
-    https://your-server.com/postback?cid={clickid}&payout={payout}&campaign={campaign}&country={country}&offer={offer}&source={trafficsource}
-    
-    Du kan tilføje flere parametre efter behov.
+    Modtag postback - send til Telegram (instant) og videresend til Voluum.
+    Brug denne URL i affiliate network: https://din-railway.app/postback?cid=...
+    Sæt VOLUUM_FORWARD_URL til din Voluum tracking domain så de stadig modtager.
     """
-    # Get data from either GET or POST
+    # Get data - affiliate sender typisk GET med query params
     if request.method == "POST":
-        data = request.form.to_dict() or request.json or {}
+        payload = request.json or request.form.to_dict() or {}
+        data = payload[0] if isinstance(payload, list) and payload else payload
     else:
-        data = request.args.to_dict()
+        data = dict(request.args)
+    
+    if isinstance(data, dict):
+        data = {str(k): v for k, v in data.items()}
+    else:
+        data = {}
     
     logger.info(f"Received postback: {data}")
     
     if not data:
         return jsonify({"error": "No data received"}), 400
     
-    # Format and send message
-    message = format_ftd_message(data)
-    success, error = send_telegram_message(message)
+    # KUN send for konverteringer med payout/revenue (FTD)
+    payout_val = (
+        data.get("payout") or data.get("revenue") or data.get("amount")
+        or data.get("allConversionsRevenue") or data.get("Payout") or data.get("Revenue")
+    )
+    payout_num = 0
+    if payout_val is not None and payout_val != "":
+        try:
+            payout_num = float(payout_val)
+        except (TypeError, ValueError):
+            pass
     
-    if success:
-        return jsonify({"status": "ok", "message": "Notification sent"}), 200
-    else:
-        return jsonify({"status": "error", "message": error or "Failed to send notification"}), 500
+    # Altid videresend til Voluum (så de får alle konverteringer)
+    _forward_to_voluum()
+    
+    # Spring over Telegram hvis ingen payout - KUN FTD med revenue
+    if payout_num <= 0:
+        logger.info(f"Ingen payout - springer Telegram over")
+        return jsonify({"status": "skipped", "message": "No payout"}), 200
+    
+    conv_type = str(data.get("conversionType", data.get("conversion_type", data.get("et", data.get("type", ""))))).upper()
+    if conv_type and "FTD" not in conv_type and "CUSTOM" not in conv_type:
+        logger.info(f"Ikke FTD (type={conv_type}) - springer Telegram over")
+        return jsonify({"status": "skipped", "message": "Not FTD"}), 200
+    
+    # Send Telegram (instant)
+    message = format_ftd_message(data)
+    send_telegram_message(message)
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/debug", methods=["POST"])
+def debug():
+    """Se præcis hvad Zapier sender - brug denne URL i Zapier test, så vises data i response."""
+    try:
+        data = request.json or request.form.to_dict() or {}
+    except Exception:
+        data = {"raw": request.get_data(as_text=True)}
+    if isinstance(data, list) and data:
+        data = data[0]
+    keys = list(data.keys()) if isinstance(data, dict) else []
+    return jsonify({"received": data, "keys": keys}), 200
 
 
 @app.route("/test", methods=["GET"])
