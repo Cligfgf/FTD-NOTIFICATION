@@ -85,7 +85,9 @@ def format_ftd_message(data: dict) -> str:
     try:
         p = f"${float(payout):.2f}"
     except (TypeError, ValueError):
-        p = str(payout) if payout else "?"
+        p = str(payout) if payout else "0"
+    if not str(p).startswith("$"):
+        p = f"${p}"
     flag = country_to_flag(str(country)[:2] if country else "")
     return f"{flag} - {offer} - {p}"
 
