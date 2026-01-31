@@ -41,27 +41,30 @@ def send_telegram(msg):
     r.raise_for_status()
 
 
-def format_ftd(row, i):
-    conv = int(row.get("conversions", 0) or 0) + int(row.get("customConversions1", 0) or 0) + int(row.get("customConversions2", 0) or 0)
-    rev = float(row.get("allConversionsRevenue", 0) or 0) + float(row.get("customRevenue1", 0) or 0) + float(row.get("customRevenue2", 0) or 0)
-    updated = row.get("updated") or row.get("created", "")
+def country_to_flag(code):
+    if not code:
+        return "🌍"
+    s = str(code).strip()
+    # Voluum sender fuldt landenavn - kort mapping
+    mapping = {"czech republic": "CZ", "norway": "NO", "sweden": "SE", "denmark": "DK", "finland": "FI",
+               "germany": "DE", "italy": "IT", "spain": "ES", "france": "FR", "poland": "PL", "uk": "GB"}
+    code = mapping.get(s.lower(), s[:2] if len(s) == 2 else "🌍")
+    if code == "🌍" or len(code) != 2:
+        return "🌍"
     try:
-        if isinstance(updated, (int, float)):
-            ts = datetime.fromtimestamp(updated / 1000).strftime("%d/%m %H:%M")
-        else:
-            ts = str(updated)[:16].replace("T", " ") if updated else "N/A"
-    except Exception:
-        ts = "N/A"
-    return f"""🎉 <b>FTD #{i}</b> 🎉
+        return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code.upper() if "A" <= c <= "Z")
+    except (TypeError, ValueError):
+        return "🌍"
 
-📢 <b>Campaign:</b> {row.get('campaignName', 'N/A')}
-📍 <b>Country:</b> {row.get('campaignCountry', 'N/A')}
-🔗 <b>Source:</b> {row.get('trafficSourceName', 'N/A')}
 
-➕ <b>Konverteringer:</b> {conv}
-💰 <b>Revenue:</b> ${rev:.2f}
-
-⏰ <b>Sidst opdateret:</b> {ts}"""
+def format_ftd(row, i):
+    # Offer - IKKE campaignName. campaignNamePostfix indeholder ofte offer-delen
+    offer = row.get("offerName") or row.get("offer") or row.get("lander") or row.get("campaignNamePostfix") or "?"
+    country = row.get("campaignCountry", row.get("countryCode", ""))
+    rev = float(row.get("allConversionsRevenue", 0) or 0) + float(row.get("customRevenue1", 0) or 0) + float(row.get("customRevenue2", 0) or 0)
+    p = f"${rev:.2f}"
+    flag = country_to_flag(str(country)[:2] if country else "")
+    return f"{p} - {offer} - {flag}"
 
 
 

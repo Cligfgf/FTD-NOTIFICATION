@@ -89,7 +89,7 @@ def format_ftd_message(data: dict) -> str:
     if not str(p).startswith("$"):
         p = f"${p}"
     flag = country_to_flag(str(country)[:2] if country else "")
-    return f"{flag} - {offer} - {p}"
+    return f"{p} - {offer} - {flag}"
 
 
 @app.route("/", methods=["GET"])
