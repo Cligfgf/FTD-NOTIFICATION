@@ -67,18 +67,18 @@ git push
 
 ---
 
-## Alternativ: Hent alle FTD'er seneste 30 min (Zapier Schedule)
+## Alternativ: Hent de 3 seneste FTD'er (Zapier Schedule)
 
-Hvis du vil hente **alle** FTD'er fra de seneste 30 minutter (ikke kun nye):
+Hent de **3 seneste FTD'er** fra Voluum og send til Telegram-gruppen:
 
 1. **Create Zap**
 2. **Trigger:** Søg **Schedule by Zapier** → vælg **Every 15 minutes** (eller 30 min)
 3. **Action:** Søg **Webhooks by Zapier** → vælg **GET**
-4. **URL:** `https://web-production-d7e9.up.railway.app/fetch-ftds?secret=DIT_CRON_SECRET&minutes=30`
+4. **URL:** `https://web-production-d7e9.up.railway.app/fetch-ftds?secret=DIT_CRON_SECRET`
    - Erstat `DIT_CRON_SECRET` med samme værdi som `CRON_SECRET` i Railway Variables
 5. **Publish** Zap'en
 
-Dette kalder vores app direkte, som henter FTD'er fra Voluum API og sender dem til Telegram. Fungerer uafhængigt af Voluum trigger.
+**Vigtigt:** Sæt `TELEGRAM_CHAT_ID` i Railway til gruppe-id (fx `-5135606632`) så beskeder kommer i gruppen.
 
 ---
 
