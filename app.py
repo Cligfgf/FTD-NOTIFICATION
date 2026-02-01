@@ -200,7 +200,8 @@ def _normalize_postback_data(raw: dict) -> dict:
 def postback():
     """
     Modtag postback - send til Telegram (instant) og videresend til Voluum.
-    Zapier POST til denne URL med Voluum conversion data.
+    Zapier POST til denne URL med Voluum Conversions data.
+    KUN konverteringer med Revenue > 0 sendes til Telegram (springer Registration/$0 over).
     """
     if request.method == "POST":
         payload = request.json or request.form.to_dict() or {}
@@ -286,8 +287,9 @@ def postback():
 @app.route("/fetch-ftds", methods=["GET"])
 def fetch_ftds():
     """
-    Hent de 3 seneste FTD'er fra Voluum og send til Telegram-gruppen.
-    Bruger TELEGRAM_CHAT_ID (sæt til gruppe-id fx -5135606632).
+    Hent offers med revenue fra Voluum report (AGGREGERET - ikke enkelte konverteringer).
+    Voluum report-API giver kun kampagne/offer-totaler, ikke individuelle Conversions.
+    For enkelte FTD'er med revenue>0: brug Zapier eller affiliate postback til /postback.
     URL: https://DIN-RAILWAY-URL/fetch-ftds?secret=DIT_CRON_SECRET
     """
     err = _require_cron_secret()
@@ -389,6 +391,31 @@ def test():
         return jsonify({"status": "ok", "message": "Test notification sent!"}), 200
     else:
         return jsonify({"status": "error", "message": error or "Failed to send test notification"}), 500
+
+
+@app.route("/test-conversion", methods=["GET"])
+def test_conversion():
+    """
+    Test med en enkelt konvertering (som Zapier sender) – Revenue > 0, DEPOSIT type.
+    Simulerer præcis hvad Zapier sender fra Voluum Conversions.
+    """
+    # Zapier/Voluum format: individuell konvertering med revenue > 0
+    test_data = {
+        "Revenue": 142.50,
+        "All Conversions Revenue": 142.50,
+        "Offer Name": "Casino - Test Offer",
+        "Campaign name": "SWIS - Germany - Test",
+        "Country": "Germany",
+        "Conversion type": "DEPOSIT",
+        "Click ID": "test-conv-001",
+    }
+    message = format_ftd_message(test_data)
+    success, error = send_telegram_message(message)
+    
+    if success:
+        return jsonify({"status": "ok", "message": "Test conversion sent! (Revenue > 0, DEPOSIT)"}), 200
+    else:
+        return jsonify({"status": "error", "message": error}), 500
 
 
 def _require_cron_secret():
