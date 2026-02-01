@@ -283,6 +283,80 @@ def postback():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/fetch-ftds", methods=["GET"])
+def fetch_ftds():
+    """
+    Hent alle FTD'er fra Voluum (seneste 30 min) og send til Telegram.
+    Kald fra Zapier Schedule (hvert 15-30 min) eller cron-job.org.
+    URL: https://DIN-RAILWAY-URL/fetch-ftds?secret=DIT_CRON_SECRET&minutes=30
+    """
+    err = _require_cron_secret()
+    if err:
+        return err
+
+    if not VOLUUM_EMAIL or not VOLUUM_PASSWORD:
+        return jsonify({"error": "VOLUUM_EMAIL og VOLUUM_PASSWORD mangler"}), 500
+
+    minutes = int(request.args.get("minutes", "30"))
+    if minutes < 1 or minutes > 1440:
+        minutes = 30
+
+    # Auth
+    try:
+        r = requests.post("https://api.voluum.com/auth/session",
+            json={"email": VOLUUM_EMAIL, "password": VOLUUM_PASSWORD},
+            headers={"Content-Type": "application/json"}, timeout=15)
+        r.raise_for_status()
+        token = r.json().get("token")
+    except requests.RequestException as e:
+        logger.error(f"Voluum auth fejl: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    # Hent report – sidste X minutter, groupBy=offer for at få revenue per offer
+    now = datetime.utcnow()
+    to_t = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    from_dt = now - timedelta(minutes=minutes)
+    from_t = from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    # Prøv conversion-niveau: groupBy=conversion eller clickId
+    sent_count = 0
+    for group_by in ("conversion", "clickId", "offer"):
+        url = f"https://api.voluum.com/report?from={from_t}&to={to_t}&tz=UTC&groupBy={group_by}&limit=500"
+        try:
+            resp = requests.get(url, headers={"cwauth-token": token, "Content-Type": "application/json"}, timeout=30)
+            resp.raise_for_status()
+            rows = resp.json().get("rows", [])
+        except requests.RequestException as e:
+            logger.warning(f"Voluum report groupBy={group_by} fejl: {e}")
+            continue
+
+        def _revenue(row):
+            r1 = float(row.get("allConversionsRevenue", 0) or row.get("revenue", 0) or 0)
+            r2 = float(row.get("customRevenue1", 0) or 0)
+            r3 = float(row.get("customRevenue2", 0) or 0)
+            return r1 + r2 + r3
+
+        for row in rows:
+            rev = _revenue(row)
+            if rev <= 0:
+                continue
+            data = {
+                "offer": row.get("offerName") or row.get("offer") or "?",
+                "country": row.get("offerCountry") or row.get("campaignCountry") or row.get("countryCode") or "",
+                "revenue": rev,
+                "payout": rev,
+            }
+            msg = format_ftd_message(data)
+            ok, _ = send_telegram_message(msg)
+            if ok:
+                sent_count += 1
+
+        if rows:
+            break
+
+    return jsonify({"status": "ok", "ftds_sent": sent_count, "minutes": minutes}), 200
+
+
 @app.route("/diagnose", methods=["GET"])
 def diagnose():
     """Se sidste postback-resultat – brug til fejlfinding."""
