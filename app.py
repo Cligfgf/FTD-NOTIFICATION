@@ -2,15 +2,14 @@
 Voluum FTD Telegram Notification Bot
 =====================================
 Modtager postback webhooks fra Voluum og sender notifikationer til Telegram.
-
-Sådan virker det:
-1. Voluum sender en postback til denne server når der sker en FTD konvertering
-2. Serveren parser dataen og sender en besked til din Telegram chat/gruppe
++ Zero-revenue check: offers med 80+ clicks uden omsætning i 1,5 time.
 """
 
 import os
+import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from flask import Flask, request, jsonify
 import requests
 from dotenv import load_dotenv
@@ -22,6 +21,21 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 VOLUUM_FORWARD_URL = os.getenv("VOLUUM_FORWARD_URL", "").rstrip("/")  # fx https://lowasteisranime.com
+VOLUUM_EMAIL = os.getenv("VOLUUM_EMAIL")
+VOLUUM_PASSWORD = os.getenv("VOLUUM_PASSWORD")
+CRON_SECRET = os.getenv("CRON_SECRET", "")  # Beskytter /cron/* – sæt til et hemmeligt ord
+CLICK_THRESHOLD = int(os.getenv("CLICK_THRESHOLD", "60"))
+WAIT_HOURS = float(os.getenv("WAIT_HOURS", "1.5"))
+# Regel 2: 125+ clicks siden sidste omsætning, 1 time ventetid
+CLICK_THRESHOLD_HIGH = int(os.getenv("CLICK_THRESHOLD_HIGH", "125"))
+WAIT_HOURS_HIGH = float(os.getenv("WAIT_HOURS_HIGH", "1"))
+
+# State-filer for zero-revenue (i projektmappen)
+_DATA_DIR = Path(__file__).parent
+ZERO_SENT_FILE = _DATA_DIR / ".zero_revenue_sent.json"
+ZERO_PENDING_FILE = _DATA_DIR / ".zero_revenue_pending.json"
+ZERO_LAST_FILE = _DATA_DIR / ".zero_revenue_last.json"
+ZERO_DATE_FILE = _DATA_DIR / ".zero_revenue_date.txt"  # Ny dag = nulstil sent
 
 # Flask app
 app = Flask(__name__)
@@ -72,12 +86,12 @@ def country_to_flag(code: str) -> str:
     if not code:
         return "🌍"
     s = str(code).strip()
-    # Fulde landenavne -> ISO-kode (fx Germany -> DE, ikke Ge -> Georgia)
     mapping = {
         "germany": "DE", "denmark": "DK", "sweden": "SE", "norway": "NO", "finland": "FI",
         "czech republic": "CZ", "italy": "IT", "spain": "ES", "france": "FR", "poland": "PL",
         "uk": "GB", "united kingdom": "GB", "georgia": "GE", "austria": "AT", "switzerland": "CH",
         "netherlands": "NL", "belgium": "BE", "portugal": "PT", "greece": "GR", "romania": "RO",
+        "australia": "AU", "hungary": "HU", "ireland": "IE", "turkey": "TR",
     }
     iso = mapping.get(s.lower(), s[:2] if len(s) == 2 else "")
     if not iso or len(iso) != 2:
@@ -88,11 +102,37 @@ def country_to_flag(code: str) -> str:
         return "🌍"
 
 
+def country_to_owner(country: str) -> str:
+    """Anders/Mikkel/Gustav baseret på land."""
+    s = str(country).strip().lower()
+    anders = {"united kingdom", "uk", "australia", "france"}
+    mikkel = {"poland", "portugal", "norway", "italy", "greece", "romania", "ireland", "finland", "switzerland"}
+    gustav = {"spain", "germany", "austria", "sweden", "czech republic", "hungary", "belgium", "netherlands", "turkey"}
+    if s in anders:
+        return "Anders"
+    if s in mikkel:
+        return "Mikkel"
+    if s in gustav:
+        return "Gustav"
+    return "Anders/Mikkel/Gustav"
+
+
+def format_zero_revenue_message(offer: str, country: str, clicks: int) -> str:
+    """Zero-revenue besked: landeflag - offer ser dårlig ud X, den har fået Y uden at omsætte..."""
+    flag = country_to_flag(country or "")
+    owner = country_to_owner(country or "")
+    return f'{flag} - {offer} ser dårlig ud {owner}, den har fået {clicks} uden at omsætte, hvis det var mig ville jeg nok tage den af :D'
+
+
 def format_ftd_message(data: dict) -> str:
     """Format FTD – flag, offer, payout på én linje."""
-    offer = data.get("offer", data.get("offerName", data.get("offer_id", data.get("lander", "?"))))
-    country = data.get("country", data.get("countryCode", data.get("geo", data.get("cc", ""))))
-    payout = data.get("payout", data.get("revenue", data.get("amount", data.get("allConversionsRevenue", 0))))
+    offer = (data.get("offer") or data.get("offerName") or data.get("offer_id")
+        or data.get("lander") or data.get("Lander name") or data.get("Campaign name") or "?")
+    country = (data.get("country") or data.get("countryCode") or data.get("geo") or data.get("cc") or "")
+    # Brug Revenue (ikke Payout) fra Voluum
+    payout = (data.get("Revenue") or data.get("revenue") or data.get("Revenue (USD)")
+        or data.get("allConversionsRevenue") or data.get("conversionRevenue")
+        or data.get("payout") or data.get("Payout") or data.get("amount") or 0)
     try:
         p = f"${float(payout):.2f}"
     except (TypeError, ValueError):
@@ -128,62 +168,88 @@ def _forward_to_voluum():
         logger.error(f"Voluum forward fejl: {e}")
 
 
+def _normalize_postback_data(raw: dict) -> dict:
+    """Gør data case-insensitive og understøt Zapier/Voluum feltnavne."""
+    if not isinstance(raw, dict):
+        return {}
+    data = {}
+    for k, v in raw.items():
+        key = str(k).strip()
+        if key:
+            data[key.lower()] = v
+    return data
+
+
 @app.route("/postback", methods=["GET", "POST"])
 def postback():
     """
     Modtag postback - send til Telegram (instant) og videresend til Voluum.
-    Brug denne URL i affiliate network: https://din-railway.app/postback?cid=...
-    Sæt VOLUUM_FORWARD_URL til din Voluum tracking domain så de stadig modtager.
+    Zapier POST til denne URL med Voluum conversion data.
     """
-    # Get data - affiliate sender typisk GET med query params
     if request.method == "POST":
         payload = request.json or request.form.to_dict() or {}
-        data = payload[0] if isinstance(payload, list) and payload else payload
+        raw = payload[0] if isinstance(payload, list) and payload else payload
+        # Zapier kan sende nested: {"conversion": {...}} eller {"data": {...}}
+        if isinstance(raw, dict):
+            raw = raw.get("conversion") or raw.get("data") or raw
     else:
-        data = dict(request.args)
-    
-    if isinstance(data, dict):
-        data = {str(k): v for k, v in data.items()}
-    else:
-        data = {}
-    
+        raw = dict(request.args)
+
+    if not isinstance(raw, dict):
+        raw = {}
+    data = {str(k): v for k, v in raw.items()}
+    data_lower = _normalize_postback_data(data)
+
     logger.info(f"Received postback: {data}")
-    
+
     if not data:
         return jsonify({"error": "No data received"}), 400
-    
-    # KUN send for konverteringer med payout/revenue (FTD)
-    payout_val = (
-        data.get("payout") or data.get("revenue") or data.get("amount")
-        or data.get("allConversionsRevenue") or data.get("Payout") or data.get("Revenue")
-    )
+
+    # Revenue/payout fra Voluum – understøt alle typiske feltnavne
+    # Brug Revenue (ikke Payout) fra Voluum – tjek revenue-felter først
+    def _get_revenue(d):
+        for key in ("Revenue", "revenue", "Revenue (USD)", "Revenue(USD)", "revenue_usd",
+                    "allConversionsRevenue", "conversionRevenue", "totalRevenue",
+                    "payout", "Payout", "amount", "Amount"):
+            v = d.get(key)
+            if v is not None and v != "":
+                return v
+        for k, v in d.items():
+            if v is not None and v != "" and ("revenue" in k.lower() or "payout" in k.lower()):
+                return v
+        return None
+
+    payout_val = _get_revenue(data) or _get_revenue(data_lower)
     payout_num = 0
     if payout_val is not None and payout_val != "":
         try:
-            s = str(payout_val).replace("$", "").replace(",", ".").replace(" ", "").strip()
+            s = str(payout_val).replace("$", "").replace(",", ".").strip()
             if s:
                 payout_num = float(s)
         except (TypeError, ValueError):
             pass
-    
-    # Altid videresend til Voluum (så de får alle konverteringer)
+
     _forward_to_voluum()
-    
-    # Spring over Telegram hvis ingen payout - KUN FTD med revenue
+
     if payout_num <= 0:
-        logger.info(f"Ingen payout - springer Telegram over")
-        return jsonify({"status": "skipped", "message": "No payout"}), 200
-    
-    # Kun spring over hvis tydeligt IKKE FTD (fx lead/reg). Tom eller ukendt = send (har payout)
-    conv_type = str(data.get("conversionType", data.get("conversion_type", data.get("et", data.get("type", ""))))).upper()
-    if conv_type and "FTD" not in conv_type and "CUSTOM" not in conv_type and "SALE" not in conv_type:
-        if any(x in conv_type for x in ("LEAD", "REG", "REGISTRATION", "CLICK")):
+        logger.info(f"Ingen payout - springer Telegram over. Data: {data}")
+        return jsonify({"status": "skipped", "message": "No payout", "debug_received": data}), 200
+
+    # Kun spring over ved tydelig lead/reg - DEPOSIT/FTD sendes altid
+    conv_type = str(
+        data.get("conversionType") or data.get("conversion_type") or data.get("Conversion type")
+        or data.get("et") or data.get("type") or ""
+    ).upper()
+    if conv_type and any(x in conv_type for x in ("LEAD", "REG", "REGISTRATION", "CLICK")):
+        if "FTD" not in conv_type and "CUSTOM" not in conv_type and "SALE" not in conv_type and "DEPOSIT" not in conv_type:
             logger.info(f"Ikke FTD (type={conv_type}) - springer Telegram over")
-            return jsonify({"status": "skipped", "message": "Not FTD"}), 200
-    
-    # Send Telegram (instant)
+            return jsonify({"status": "skipped", "message": "Not FTD", "debug_received": data}), 200
+
     message = format_ftd_message(data)
-    send_telegram_message(message)
+    ok, err = send_telegram_message(message)
+    if not ok:
+        logger.error(f"Telegram fejl: {err}")
+        return jsonify({"status": "error", "message": err, "debug_received": data}), 500
     return jsonify({"status": "ok"}), 200
 
 
@@ -219,6 +285,188 @@ def test():
         return jsonify({"status": "ok", "message": "Test notification sent!"}), 200
     else:
         return jsonify({"status": "error", "message": error or "Failed to send test notification"}), 500
+
+
+def _require_cron_secret():
+    """Return 401 if CRON_SECRET ikke matcher."""
+    if not CRON_SECRET:
+        return jsonify({"error": "CRON_SECRET ikke sat i Railway"}), 500
+    got = request.args.get("secret") or (request.json or {}).get("secret")
+    if got != CRON_SECRET:
+        return jsonify({"error": "Ugyldig secret"}), 401
+    return None
+
+
+@app.route("/cron/zero-revenue", methods=["GET"])
+def cron_zero_revenue():
+    """
+    Tjek offers med 80+ clicks uden revenue i 1,5 time. Send til Telegram.
+    Kald fra cron-job.org hvert 10. minut.
+    URL: https://DIN-RAILWAY-URL/cron/zero-revenue?secret=DIT_CRON_SECRET
+    """
+    err = _require_cron_secret()
+    if err:
+        return err
+
+    if not VOLUUM_EMAIL or not VOLUUM_PASSWORD:
+        return jsonify({"error": "VOLUUM_EMAIL og VOLUUM_PASSWORD mangler"}), 500
+
+    # Hent token
+    try:
+        r = requests.post("https://api.voluum.com/auth/session",
+            json={"email": VOLUUM_EMAIL, "password": VOLUUM_PASSWORD},
+            headers={"Content-Type": "application/json"}, timeout=15)
+        r.raise_for_status()
+        token = r.json().get("token")
+    except requests.RequestException as e:
+        logger.error(f"Voluum auth fejl: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    # Hent offer-report (kun i dag)
+    now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    from_t = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00:00.000Z")
+    to_t = now.strftime("%Y-%m-%dT%H:00:00.000Z")
+    url = f"https://api.voluum.com/report?from={from_t}&to={to_t}&tz=UTC&groupBy=offer&limit=500"
+    try:
+        resp = requests.get(url, headers={"cwauth-token": token, "Content-Type": "application/json"}, timeout=30)
+        resp.raise_for_status()
+        rows = resp.json().get("rows", [])
+    except requests.RequestException as e:
+        logger.error(f"Voluum report fejl: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    def get_clicks(row):
+        return int(row.get("uniqueClicks", 0) or 0)
+
+    def get_revenue(row):
+        r1 = float(row.get("allConversionsRevenue", 0) or row.get("revenue", 0) or 0)
+        r2 = float(row.get("customRevenue1", 0) or 0)
+        r3 = float(row.get("customRevenue2", 0) or 0)
+        return r1 + r2 + r3
+
+    # Regel 1: 0 revenue i dag, 80+ clicks, 1,5t ventetid
+    # Regel 2: Har omsat, men 150+ clicks SIDEN sidste omsætning, 1t ventetid
+    # Maks 1 besked per offer
+    zero_rev_rows = [r for r in rows if get_clicks(r) >= CLICK_THRESHOLD and get_revenue(r) <= 0]
+    has_rev_rows = [r for r in rows if get_revenue(r) > 0]
+    rows_by_oid = {r.get("offerId"): r for r in rows if r.get("offerId")}
+
+    now_dt = datetime.utcnow()
+    today_str = now_dt.strftime("%Y-%m-%d")
+    is_new_day = False
+    if ZERO_DATE_FILE.exists():
+        try:
+            if ZERO_DATE_FILE.read_text().strip() != today_str:
+                is_new_day = True
+        except Exception:
+            pass
+    ZERO_DATE_FILE.write_text(today_str)
+
+    sent = set()
+    pending = {}
+    last_snap = {}
+    if not is_new_day:
+        if ZERO_SENT_FILE.exists():
+            try:
+                sent = set(json.loads(ZERO_SENT_FILE.read_text()))
+            except Exception:
+                pass
+        if ZERO_PENDING_FILE.exists():
+            try:
+                pending = json.loads(ZERO_PENDING_FILE.read_text())
+            except Exception:
+                pass
+        if ZERO_LAST_FILE.exists():
+            try:
+                last_snap = json.loads(ZERO_LAST_FILE.read_text())
+            except Exception:
+                pass
+
+    new_pending = {}
+    new_snap = {}
+    sent_count = 0
+
+    # Regel 1: 0 revenue, 60+ clicks, 1,5t
+    for row in zero_rev_rows:
+        oid = row.get("offerId", "")
+        if not oid or oid in sent:
+            continue
+        offer = row.get("offerName") or row.get("offer", "?")
+        uclicks = get_clicks(row)
+        entry = pending.get(oid, {})
+        first_80 = entry.get("first_seen_80") or entry.get("first_seen")
+        if not first_80:
+            first_80 = now_dt.timestamp()
+        try:
+            elapsed = (now_dt.timestamp() - float(first_80)) / 3600
+        except (TypeError, ValueError):
+            new_pending[oid] = {"first_seen_80": first_80}
+            new_snap[oid] = {"clicks": uclicks, "revenue": 0}
+            continue
+        if elapsed >= WAIT_HOURS:
+            country = row.get("offerCountry", row.get("campaignCountry", ""))
+            msg = format_zero_revenue_message(offer, country, uclicks)
+            ok, _ = send_telegram_message(msg)
+            if ok:
+                sent.add(oid)
+                sent_count += 1
+                logger.info(f"Zero-revenue alert (80+): {offer}")
+            new_snap[oid] = {"clicks": uclicks, "revenue": 0}
+            continue
+        new_pending[oid] = {"first_seen_80": first_80}
+        new_snap[oid] = {"clicks": uclicks, "revenue": 0}
+
+    # Regel 2: Har omsat, men 150+ clicks siden sidste omsætning, 1t
+    for row in has_rev_rows:
+        oid = row.get("offerId", "")
+        if not oid or oid in sent:
+            continue
+        uclicks = get_clicks(row)
+        rev = get_revenue(row)
+        prev = last_snap.get(oid, {})
+        prev_clicks = int(prev.get("clicks", 0) or 0)
+        prev_rev = float(prev.get("revenue", 0) or 0)
+        new_snap[oid] = {"clicks": uclicks, "revenue": rev}
+
+        if prev_rev <= 0:
+            continue  # Første gang vi ser offer med revenue – mangler baseline
+        if rev > prev_rev:
+            continue  # Ny omsætning – nulstil timer
+        clicks_since = uclicks - prev_clicks
+        if clicks_since < CLICK_THRESHOLD_HIGH:
+            continue
+
+        offer = row.get("offerName") or row.get("offer", "?")
+        entry = pending.get(oid, {})
+        first_150 = entry.get("first_seen_150")
+        if not first_150:
+            first_150 = now_dt.timestamp()
+        try:
+            elapsed = (now_dt.timestamp() - float(first_150)) / 3600
+        except (TypeError, ValueError):
+            new_pending[oid] = {**entry, "first_seen_150": first_150}
+            continue
+        if elapsed >= WAIT_HOURS_HIGH:
+            country = row.get("offerCountry", row.get("campaignCountry", ""))
+            msg = format_zero_revenue_message(offer, country, uclicks)
+            ok, _ = send_telegram_message(msg)
+            if ok:
+                sent.add(oid)
+                sent_count += 1
+                logger.info(f"Zero-revenue alert (150+ siden omsætning): {offer}")
+            continue
+        new_pending[oid] = {**entry, "first_seen_150": first_150}
+
+    # Behold pending for offers vi stadig tracker
+    for oid, row in rows_by_oid.items():
+        if oid not in new_snap:
+            new_snap[oid] = {"clicks": get_clicks(row), "revenue": get_revenue(row)}
+
+    ZERO_SENT_FILE.write_text(json.dumps(list(sent)))
+    ZERO_PENDING_FILE.write_text(json.dumps(new_pending))
+    ZERO_LAST_FILE.write_text(json.dumps(new_snap))
+
+    return jsonify({"status": "ok", "alerts_sent": sent_count}), 200
 
 
 if __name__ == "__main__":
