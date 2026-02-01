@@ -40,6 +40,9 @@ ZERO_DATE_FILE = _DATA_DIR / ".zero_revenue_date.txt"  # Ny dag = nulstil sent
 # Flask app
 app = Flask(__name__)
 
+# Sidste postback-resultat (til fejlfinding)
+_last_postback = {"status": None, "message": None, "at": None}
+
 # Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -129,10 +132,23 @@ def format_ftd_message(data: dict) -> str:
     offer = (data.get("offer") or data.get("offerName") or data.get("offer_id")
         or data.get("lander") or data.get("Lander name") or data.get("Campaign name") or "?")
     country = (data.get("country") or data.get("countryCode") or data.get("geo") or data.get("cc") or "")
-    # Brug Revenue (ikke Payout) fra Voluum
-    payout = (data.get("Revenue") or data.get("revenue") or data.get("Revenue (USD)")
-        or data.get("allConversionsRevenue") or data.get("conversionRevenue")
-        or data.get("payout") or data.get("Payout") or data.get("amount") or 0)
+    # Brug Revenue (foretrækkes) eller Payout – første positive værdi
+    def _first_positive(*vals):
+        for v in vals:
+            if v is None or v == "":
+                continue
+            try:
+                n = float(str(v).replace("$", "").replace(",", ".").strip())
+                if n > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+        return 0
+    payout = _first_positive(
+        data.get("Revenue"), data.get("revenue"), data.get("Revenue (USD)"),
+        data.get("allConversionsRevenue"), data.get("conversionRevenue"),
+        data.get("payout"), data.get("Payout"), data.get("amount")
+    )
     try:
         p = f"${float(payout):.2f}"
     except (TypeError, ValueError):
@@ -189,7 +205,7 @@ def postback():
     if request.method == "POST":
         payload = request.json or request.form.to_dict() or {}
         raw = payload[0] if isinstance(payload, list) and payload else payload
-        # Zapier kan sende nested: {"conversion": {...}} eller {"data": {...}}
+        # Zapier/Voluum: nested {"conversion": {...}}, {"data": {...}}, eller flad obj
         if isinstance(raw, dict):
             raw = raw.get("conversion") or raw.get("data") or raw
     else:
@@ -203,20 +219,30 @@ def postback():
     logger.info(f"Received postback: {data}")
 
     if not data:
+        _last_postback.update({"status": "error", "message": "No data", "at": datetime.utcnow().isoformat()})
         return jsonify({"error": "No data received"}), 400
 
-    # Revenue/payout fra Voluum – understøt alle typiske feltnavne
-    # Brug Revenue (ikke Payout) fra Voluum – tjek revenue-felter først
+    # Revenue (foretrækkes) eller Payout fra Voluum – spring over 0, brug første positive værdi
+    def _parse_num(val):
+        if val is None or val == "":
+            return 0
+        try:
+            s = str(val).replace("$", "").replace(",", ".").strip()
+            return float(s) if s else 0
+        except (TypeError, ValueError):
+            return 0
+
     def _get_revenue(d):
-        for key in ("Revenue", "revenue", "Revenue (USD)", "Revenue(USD)", "revenue_usd",
-                    "allConversionsRevenue", "conversionRevenue", "totalRevenue",
-                    "payout", "Payout", "amount", "Amount"):
+        keys = ("Revenue", "revenue", "Revenue (USD)", "Revenue(USD)", "allConversionsRevenue",
+                "conversionRevenue", "totalRevenue", "payout", "Payout", "amount", "Amount")
+        for key in keys:
             v = d.get(key)
-            if v is not None and v != "":
+            if v is not None and v != "" and _parse_num(v) > 0:
                 return v
         for k, v in d.items():
             if v is not None and v != "" and ("revenue" in k.lower() or "payout" in k.lower()):
-                return v
+                if _parse_num(v) > 0:
+                    return v
         return None
 
     payout_val = _get_revenue(data) or _get_revenue(data_lower)
@@ -232,6 +258,7 @@ def postback():
     _forward_to_voluum()
 
     if payout_num <= 0:
+        _last_postback.update({"status": "skipped", "message": "No payout", "at": datetime.utcnow().isoformat(), "debug_keys": list(data.keys())})
         logger.info(f"Ingen payout - springer Telegram over. Data: {data}")
         return jsonify({"status": "skipped", "message": "No payout", "debug_received": data}), 200
 
@@ -242,15 +269,27 @@ def postback():
     ).upper()
     if conv_type and any(x in conv_type for x in ("LEAD", "REG", "REGISTRATION", "CLICK")):
         if "FTD" not in conv_type and "CUSTOM" not in conv_type and "SALE" not in conv_type and "DEPOSIT" not in conv_type:
+            _last_postback.update({"status": "skipped", "message": f"Not FTD (type={conv_type})", "at": datetime.utcnow().isoformat()})
             logger.info(f"Ikke FTD (type={conv_type}) - springer Telegram over")
             return jsonify({"status": "skipped", "message": "Not FTD", "debug_received": data}), 200
 
     message = format_ftd_message(data)
     ok, err = send_telegram_message(message)
     if not ok:
+        _last_postback.update({"status": "error", "message": err, "at": datetime.utcnow().isoformat()})
         logger.error(f"Telegram fejl: {err}")
         return jsonify({"status": "error", "message": err, "debug_received": data}), 500
+    _last_postback.update({"status": "ok", "message": "Sent", "at": datetime.utcnow().isoformat()})
     return jsonify({"status": "ok"}), 200
+
+
+@app.route("/diagnose", methods=["GET"])
+def diagnose():
+    """Se sidste postback-resultat – brug til fejlfinding."""
+    return jsonify({
+        "last_postback": _last_postback,
+        "tip": "Hvis status er 'skipped' med 'No payout', tjek at Zapier sender Revenue/Payout felt. Brug /debug i Zapier POST URL for at se raw data."
+    }), 200
 
 
 @app.route("/debug", methods=["POST"])

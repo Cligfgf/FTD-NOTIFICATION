@@ -45,13 +45,13 @@ git push
    - **URL:** `https://DIN-RAILWAY-URL/postback`
      (Erstat med din Railway URL – fx `https://web-production-d7e9.up.railway.app/postback`)
    - **Payload Type:** JSON
-   - **Data:** Vælg "Map" og tilføj felter fra Voluum:
-     - `cid` eller `clickId` → fra Voluum
-     - `payout` eller `revenue` → fra Voluum
-     - `campaign` eller `campaignName` → fra Voluum
-     - `country` eller `countryCode` → fra Voluum
-     - `offer` eller `offerName` → fra Voluum
-     - `source` eller `trafficSourceName` → fra Voluum
+   - **Data:** Vælg "Map" og tilføj felter fra Voluum (vælg fra dropdown – **ikke** skriv manuelt):
+     - **Revenue** eller **Payout** → VIGTIGT, kræves for FTD-besked
+     - `cid` eller `clickId`
+     - `offer` eller `offerName` eller `Lander name`
+     - `country` eller `countryCode`
+     - `campaign` eller `campaignName`
+     - `conversionType` eller `Conversion type` (valgfrit)
    - Klik **Test action**
 
 4. **Publish** Zap’en
@@ -64,3 +64,15 @@ git push
 - Du får besked på Telegram
 
 **Bemærk:** På Zapier Free plan tjekkes der typisk hvert 15. minut for nye konverteringer. For hurtigere (ca. hvert minut) kræves en betalt plan.
+
+---
+
+## Fejlfinding: FTD kommer ikke
+
+1. **Tjek at Zap er slået til** (Published, ikke Draft)
+2. **Tjek POST URL** – skal være `https://web-production-d7e9.up.railway.app/postback` (eller din Railway URL)
+3. **Tjek felt-mapping** – i Webhooks-step: vælg felter fra Voluum (ikke skriv feltnavne manuelt). Vigtigst: **Revenue** eller **Payout** med talværdi > 0
+4. **Test** – i Zapier: Test trigger → Test action. Tjek at POST får 200 OK
+5. **Brug /diagnose** – åbn `https://DIN-RAILWAY-URL/diagnose` i browser. Viser sidste postback-resultat (ok/skipped/error)
+6. **Brug /debug** – sæt POST URL midlertidigt til `.../debug` for at se præcis hvad Zapier sender. Skift tilbage til `/postback` bagefter
+7. **Railway logs** – i Railway: Logs-tab. Se om requests ankommer og evt. fejlmeddelelser
