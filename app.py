@@ -160,7 +160,9 @@ def postback():
     payout_num = 0
     if payout_val is not None and payout_val != "":
         try:
-            payout_num = float(payout_val)
+            s = str(payout_val).replace("$", "").replace(",", ".").replace(" ", "").strip()
+            if s:
+                payout_num = float(s)
         except (TypeError, ValueError):
             pass
     
