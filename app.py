@@ -356,7 +356,7 @@ def poll_new_ftds():
     """
     Poll Voluum for NYE konverteringer med revenue > 0. Sender EN besked per konvertering.
     Kald fra cron-job.org hvert 1-2 minut for næsten-instant notifikationer.
-    Bruger campaign-niveau: ved delta sender vi én besked per ny konvertering.
+    ?test=2 sender de 2 seneste FTD'er til Telegram (til test).
     URL: https://DIN-RAILWAY-URL/poll-new-ftds?secret=DIT_CRON_SECRET
     """
     err = _require_cron_secret()
@@ -377,7 +377,7 @@ def poll_new_ftds():
         return jsonify({"error": str(e)}), 500
 
     now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-    from_t = (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:00:00.000Z")
+    from_t = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:00:00.000Z")
     to_t = now.strftime("%Y-%m-%dT%H:00:00.000Z")
     url = f"https://api.voluum.com/report?from={from_t}&to={to_t}&tz=UTC&groupBy=campaign&limit=500"
     try:
@@ -396,6 +396,30 @@ def poll_new_ftds():
         r2 = float(row.get("customRevenue1", 0) or 0)
         r3 = float(row.get("customRevenue2", 0) or 0)
         return r1 + r2 + r3
+
+    # Test: send de N seneste FTD'er (baseret på kampagner med revenue, sorteret efter opdateret)
+    test_n = request.args.get("test", type=int)
+    if test_n and test_n > 0:
+        with_rev = [row for row in rows if get_conv(row) > 0 and get_rev(row) > 0]
+        with_rev.sort(key=lambda r: r.get("updated") or r.get("created") or "", reverse=True)
+        messages_to_send = []
+        for row in with_rev:
+            if len(messages_to_send) >= test_n:
+                break
+            n_conv = get_conv(row)
+            total_rev = get_rev(row)
+            rev_per = total_rev / n_conv
+            offer = row.get("offerName") or row.get("offer") or row.get("campaignNamePostfix") or row.get("campaignName") or "?"
+            country = row.get("offerCountry") or row.get("campaignCountry") or row.get("countryCode") or ""
+            for _ in range(min(n_conv, test_n - len(messages_to_send))):
+                messages_to_send.append({"offer": offer, "country": country, "revenue": rev_per})
+        sent_count = 0
+        for data in messages_to_send:
+            msg = format_ftd_message({**data, "payout": data["revenue"]})
+            ok, _ = send_telegram_message(msg)
+            if ok:
+                sent_count += 1
+        return jsonify({"status": "ok", "ftds_sent": sent_count, "test": True, "message": f"Sendt {sent_count} seneste FTD'er til Telegram"}), 200
 
     last_state = {}
     if POLL_FTD_STATE_FILE.exists():
