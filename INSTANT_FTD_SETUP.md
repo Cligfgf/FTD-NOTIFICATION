@@ -64,6 +64,19 @@ Vi videresender postback derhen, så Voluum stadig modtager alle konverteringer.
 
 ---
 
+## Alternativ: Poll fra cron (uden Zapier)
+
+Hvis Zapier ikke trigger: Brug **cron-job.org** til at kalde vores poller hvert 1-2 minut:
+
+**URL:** `https://web-production-d7e9.up.railway.app/poll-new-ftds?secret=DIT_CRON_SECRET`
+
+Dette henter nye konverteringer fra Voluum og sender **én besked per konvertering** med revenue > 0.
+
+**Første kørsel:** Gemmer baseline (sender ingen beskeder).  
+**Næste kørsler:** Sender en besked for hver NY konvertering med revenue.
+
+---
+
 ## Hvis du ikke kan ændre postback
 
 Hvis du ikke må/skal ændre postback-URL i affiliate-netværket:

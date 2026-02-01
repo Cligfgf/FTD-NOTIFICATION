@@ -6,3 +6,8 @@ venv/
 .venv/
 .seen_conversions.json
 .voluum_state.json
+.zero_revenue_sent.json
+.zero_revenue_pending.json
+.zero_revenue_last.json
+.zero_revenue_date.txt
+.poll_ftd_state.json

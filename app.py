@@ -36,6 +36,7 @@ ZERO_SENT_FILE = _DATA_DIR / ".zero_revenue_sent.json"
 ZERO_PENDING_FILE = _DATA_DIR / ".zero_revenue_pending.json"
 ZERO_LAST_FILE = _DATA_DIR / ".zero_revenue_last.json"
 ZERO_DATE_FILE = _DATA_DIR / ".zero_revenue_date.txt"  # Ny dag = nulstil sent
+POLL_FTD_STATE_FILE = _DATA_DIR / ".poll_ftd_state.json"  # State for poll-new-ftds
 
 # Flask app
 app = Flask(__name__)
@@ -348,6 +349,100 @@ def fetch_ftds():
             sent_count += 1
 
     return jsonify({"status": "ok", "ftds_sent": sent_count, "message": f"Sendt {sent_count} af {len(top3)} til Telegram"}), 200
+
+
+@app.route("/poll-new-ftds", methods=["GET"])
+def poll_new_ftds():
+    """
+    Poll Voluum for NYE konverteringer med revenue > 0. Sender EN besked per konvertering.
+    Kald fra cron-job.org hvert 1-2 minut for næsten-instant notifikationer.
+    Bruger campaign-niveau: ved delta sender vi én besked per ny konvertering.
+    URL: https://DIN-RAILWAY-URL/poll-new-ftds?secret=DIT_CRON_SECRET
+    """
+    err = _require_cron_secret()
+    if err:
+        return err
+
+    if not VOLUUM_EMAIL or not VOLUUM_PASSWORD:
+        return jsonify({"error": "VOLUUM_EMAIL og VOLUUM_PASSWORD mangler"}), 500
+
+    try:
+        r = requests.post("https://api.voluum.com/auth/session",
+            json={"email": VOLUUM_EMAIL, "password": VOLUUM_PASSWORD},
+            headers={"Content-Type": "application/json"}, timeout=15)
+        r.raise_for_status()
+        token = r.json().get("token")
+    except requests.RequestException as e:
+        logger.error(f"Voluum auth fejl: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    from_t = (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:00:00.000Z")
+    to_t = now.strftime("%Y-%m-%dT%H:00:00.000Z")
+    url = f"https://api.voluum.com/report?from={from_t}&to={to_t}&tz=UTC&groupBy=campaign&limit=500"
+    try:
+        resp = requests.get(url, headers={"cwauth-token": token, "Content-Type": "application/json"}, timeout=30)
+        resp.raise_for_status()
+        rows = resp.json().get("rows", [])
+    except requests.RequestException as e:
+        logger.error(f"Voluum report fejl: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    def get_conv(row):
+        return int(row.get("conversions", 0) or 0) + int(row.get("customConversions1", 0) or 0) + int(row.get("customConversions2", 0) or 0)
+
+    def get_rev(row):
+        r1 = float(row.get("allConversionsRevenue", 0) or row.get("revenue", 0) or 0)
+        r2 = float(row.get("customRevenue1", 0) or 0)
+        r3 = float(row.get("customRevenue2", 0) or 0)
+        return r1 + r2 + r3
+
+    last_state = {}
+    if POLL_FTD_STATE_FILE.exists():
+        try:
+            last_state = json.loads(POLL_FTD_STATE_FILE.read_text())
+        except Exception:
+            pass
+
+    new_state = {}
+    sent_count = 0
+    is_first = len(last_state) == 0
+
+    for row in rows:
+        cid = row.get("campaignId")
+        if not cid:
+            continue
+        total_conv = get_conv(row)
+        total_rev = get_rev(row)
+        new_state[cid] = {"conversions": total_conv, "revenue": total_rev}
+
+        if total_conv <= 0 or total_rev <= 0:
+            continue
+
+        prev = last_state.get(cid, {"conversions": 0, "revenue": 0})
+        delta_conv = total_conv - prev.get("conversions", 0)
+        delta_rev = total_rev - prev.get("revenue", 0)
+
+        if is_first or delta_conv <= 0 or delta_rev <= 0:
+            continue
+
+        rev_per_conv = delta_rev / delta_conv
+        offer = row.get("offerName") or row.get("offer") or row.get("campaignNamePostfix") or row.get("campaignName") or "?"
+        country = row.get("offerCountry") or row.get("campaignCountry") or row.get("countryCode") or ""
+
+        for _ in range(delta_conv):
+            data = {"offer": offer, "country": country, "revenue": rev_per_conv, "payout": rev_per_conv}
+            msg = format_ftd_message(data)
+            ok, _ = send_telegram_message(msg)
+            if ok:
+                sent_count += 1
+
+    try:
+        POLL_FTD_STATE_FILE.write_text(json.dumps(new_state))
+    except Exception as e:
+        logger.warning(f"Kunne ikke gemme state: {e}")
+
+    return jsonify({"status": "ok", "ftds_sent": sent_count, "first_run": is_first}), 200
 
 
 @app.route("/diagnose", methods=["GET"])
